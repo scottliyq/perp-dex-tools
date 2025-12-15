@@ -8,6 +8,7 @@ import time
 import argparse
 import traceback
 import csv
+import aiohttp
 from decimal import Decimal
 from typing import Tuple
 
@@ -138,6 +139,10 @@ class HedgeBot:
         self.aster_api_key = os.getenv('ASTER_API_KEY')
         self.aster_secret_key = os.getenv('ASTER_SECRET_KEY')
 
+        # Pushover configuration
+        self.pushover_user_key = os.getenv('PUSHOVER_USER_KEY')
+        self.pushover_api_token = os.getenv('PUSHOVER_API_TOKEN')
+
         # Strategy state
         self.waiting_for_aster_fill = False
         self.wait_start_time = None
@@ -190,6 +195,38 @@ class HedgeBot:
             ])
 
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+
+    async def send_pushover_alert(self, title: str, message: str, priority: int = 0):
+        """Send alert via Pushover.
+        
+        Args:
+            title: Alert title
+            message: Alert message
+            priority: Message priority (-2 to 2, default 0)
+        """
+        if not self.pushover_user_key or not self.pushover_api_token:
+            self.logger.warning("⚠️ Pushover credentials not configured, skipping alert")
+            return
+
+        try:
+            url = "https://api.pushover.net/1/messages.json"
+            data = {
+                "token": self.pushover_api_token,
+                "user": self.pushover_user_key,
+                "title": title,
+                "message": message,
+                "priority": priority
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=data) as response:
+                    if response.status == 200:
+                        self.logger.info(f"✅ Pushover alert sent: {title}")
+                    else:
+                        result = await response.text()
+                        self.logger.error(f"❌ Failed to send Pushover alert: {response.status} - {result}")
+        except Exception as e:
+            self.logger.error(f"❌ Error sending Pushover alert: {e}")
 
     def handle_aster_order_result(self, order_data):
         """Handle Aster order result."""
@@ -518,13 +555,39 @@ class HedgeBot:
                 # Fallback: 手动更新仓位并标记为已成交
                 self.logger.warning("⚠️ Using fallback - manually updating position and marking as filled")
                 
-                # 从 current_aster_side 和 current_aster_quantity 更新仓位
-                if self.current_aster_side and self.current_aster_quantity:
-                    if self.current_aster_side.lower() == 'buy':
-                        self.aster_position += self.current_aster_quantity
+                # 尝试获取订单信息以获取实际成交价格
+                try:
+                    order_info = await self.aster_client.get_order_info(order_id)
+                    if order_info and order_info.filled_size > 0:
+                        # 使用实际成交数据
+                        filled_quantity = order_info.filled_size
+                        filled_price = order_info.price
+                        self.logger.info(f"⚠️ Fallback - Retrieved order info: {filled_quantity} @ {filled_price}")
                     else:
-                        self.aster_position -= self.current_aster_quantity
-                    self.logger.warning(f"⚠️ Fallback position update: Aster {self.current_aster_side} {self.current_aster_quantity}, new position: {self.aster_position}")
+                        # 使用预期数据
+                        filled_quantity = self.current_aster_quantity
+                        filled_price = self.current_aster_price
+                        self.logger.warning(f"⚠️ Fallback - Using expected values: {filled_quantity} @ {filled_price}")
+                except Exception as e:
+                    self.logger.error(f"⚠️ Fallback - Failed to get order info: {e}")
+                    filled_quantity = self.current_aster_quantity
+                    filled_price = self.current_aster_price
+                
+                # 从 current_aster_side 和 filled_quantity 更新仓位
+                if self.current_aster_side and filled_quantity:
+                    if self.current_aster_side.lower() == 'buy':
+                        self.aster_position += filled_quantity
+                    else:
+                        self.aster_position -= filled_quantity
+                    self.logger.warning(f"⚠️ Fallback position update: Aster {self.current_aster_side} {filled_quantity}, new position: {self.aster_position}")
+                    
+                    # 记录交易到 CSV
+                    self.log_trade_to_csv(
+                        exchange='ASTER',
+                        side=self.current_aster_side.upper(),
+                        price=str(filled_price),
+                        quantity=str(filled_quantity)
+                    )
                 
                 self.aster_order_filled = True
                 self.waiting_for_aster_fill = False
@@ -701,6 +764,16 @@ class HedgeBot:
 
         await asyncio.sleep(5)
 
+        # 获取初始持仓并更新本地缓存
+        try:
+            self.logger.info("📊 Fetching initial positions...")
+            self.grvt_position = await self.grvt_client.get_real_position()
+            self.aster_position = await self.aster_client.get_real_position()
+            self.logger.info(f"✅ Initial positions - GRVT: {self.grvt_position}, Aster: {self.aster_position}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get initial positions: {e}")
+            self.logger.warning(f"⚠️ Continuing with default positions (0, 0)")
+
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
             # Auto 模式下先检查条件，满足才增加 iterations
@@ -713,8 +786,24 @@ class HedgeBot:
 
             self.logger.info(f"[STEP 1] GRVT position: {self.grvt_position} | Aster position: {self.aster_position}")
 
-            if abs(self.grvt_position + self.aster_position) > self.order_quantity * 2:
-                self.logger.error(f"❌ Position diff is too large: {self.grvt_position + self.aster_position}")
+            if abs(self.grvt_position + self.aster_position) >= self.order_quantity:
+                position_diff = self.grvt_position + self.aster_position
+                self.logger.error(f"❌ Position diff is too large: {position_diff}")
+                
+                # 发送 Pushover 警报（紧急优先级）
+                alert_title = f"🚨 {self.ticker} Position Imbalance - URGENT"
+                alert_message = (
+                    f"⚠️ CRITICAL: Position difference exceeded threshold!\n\n"
+                    f"📊 Current Positions:\n"
+                    f"  • GRVT Position: {self.grvt_position}\n"
+                    f"  • Aster Position: {self.aster_position}\n"
+                    f"  • Total Difference: {position_diff}\n\n"
+                    f"⚡ Threshold: {self.order_quantity * 2}\n"
+                    f"🔄 Iteration: {iterations + 1 if self.trade_type == 'auto' else iterations}\n\n"
+                    f"❗ Bot has stopped trading. Please check immediately!"
+                )
+                await self.send_pushover_alert(alert_title, alert_message, priority=2)
+                
                 break
 
             # Auto 模式：根据价差决定交易方向
