@@ -17,37 +17,38 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from exchanges.extended import ExtendedClient
+from exchanges.nado import NadoClient
 import websockets
 from datetime import datetime
 import pytz
 
-
 class Config:
-    """Simple config class to wrap dictionary for Extended client."""
+    """Simple config class to wrap dictionary for Nado client."""
     def __init__(self, config_dict):
         for key, value in config_dict.items():
             setattr(self, key, value)
 
 
 class HedgeBot:
-    """Trading bot that places post-only orders on Extended and hedges with market orders on Lighter."""
+    """Trading bot that places post-only orders on Nado and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0, max_position: Decimal = Decimal('0')):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
         self.sleep_time = sleep_time
-        self.extended_position = Decimal('0')
-        self.lighter_position = Decimal('0')
         self.current_order = {}
+        if max_position == Decimal('0'):
+            self.max_position = order_quantity
+        else:
+            self.max_position = max_position        
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/extended_{ticker}_hedge_mode_log.txt"
-        self.csv_filename = f"logs/extended_{ticker}_hedge_mode_trades.csv"
+        self.log_filename = f"logs/nado_{ticker}_hedge_mode_log.txt"
+        self.csv_filename = f"logs/nado_{ticker}_hedge_mode_trades.csv"
         self.original_stdout = sys.stdout
 
         # Initialize CSV file with headers if it doesn't exist
@@ -91,17 +92,17 @@ class HedgeBot:
         self.stop_flag = False
         self.order_counter = 0
 
-        # Extended state
-        self.extended_client = None
-        self.extended_contract_id = None
-        self.extended_tick_size = None
-        self.extended_order_status = None
+        # Nado state
+        self.nado_client = None
+        self.nado_contract_id = None
+        self.nado_tick_size = None
+        self.nado_order_status = None
+        self.nado_position = Decimal(0)
 
-        # Extended order book state for websocket-based BBO
-        self.extended_order_book = {'bids': {}, 'asks': {}}
-        self.extended_best_bid = None
-        self.extended_best_ask = None
-        self.extended_order_book_ready = False
+        # Nado order book state for REST API-based BBO
+        self.nado_best_bid = None
+        self.nado_best_ask = None
+        self.nado_order_book_ready = False
 
         # Lighter order book state
         self.lighter_client = None
@@ -143,25 +144,20 @@ class HedgeBot:
         self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX'))
         self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX'))
 
-        # Extended configuration
-        self.extended_vault = os.getenv('EXTENDED_VAULT')
-        self.extended_stark_key_private = os.getenv('EXTENDED_STARK_KEY_PRIVATE')
-        self.extended_stark_key_public = os.getenv('EXTENDED_STARK_KEY_PUBLIC')
-        self.extended_api_key = os.getenv('EXTENDED_API_KEY')
+        # Nado configuration
+        self.nado_private_key = os.getenv('NADO_PRIVATE_KEY')
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
 
-        # Close WebSocket connections
-        if self.extended_client:
+        # Close connections
+        if self.nado_client:
             try:
-                # Note: disconnect() is async, but shutdown() is sync
-                # We'll let the cleanup happen naturally
-                self.logger.info("🔌 Extended WebSocket will be disconnected")
+                self.logger.info("🔌 Nado client will be disconnected")
             except Exception as e:
-                self.logger.error(f"Error disconnecting Extended WebSocket: {e}")
+                self.logger.error(f"Error disconnecting Nado client: {e}")
 
         # Cancel Lighter WebSocket task
         if self.lighter_ws_task and not self.lighter_ws_task.done():
@@ -200,8 +196,6 @@ class HedgeBot:
                 quantity
             ])
 
-        self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
-
     def handle_lighter_order_result(self, order_data):
         """Handle Lighter order result from WebSocket."""
         try:
@@ -209,12 +203,16 @@ class HedgeBot:
                                               Decimal(order_data["filled_base_amount"]))
             if order_data["is_ask"]:
                 order_data["side"] = "SHORT"
+                order_type = "OPEN"
                 self.lighter_position -= Decimal(order_data["filled_base_amount"])
             else:
                 order_data["side"] = "LONG"
+                order_type = "CLOSE"
                 self.lighter_position += Decimal(order_data["filled_base_amount"])
+            
+            client_order_index = order_data["client_order_id"]
 
-            self.logger.info(f"📊 Lighter order filled: {order_data['side']} "
+            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
                              f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
 
             # Log Lighter trade to CSV
@@ -453,9 +451,9 @@ class HedgeBot:
                                 elif data.get("type") == "update/account_orders":
                                     # Handle account orders updates
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
-                                    for order_data in orders:
-                                        if order_data.get("status") == "filled":
-                                            self.handle_lighter_order_result(order_data)
+                                    for order in orders:
+                                        if order.get("status") == "filled":
+                                            self.handle_lighter_order_result(order)
                                 elif data.get("type") == "update/order_book" and not self.lighter_snapshot_loaded:
                                     # Ignore updates until we have the initial snapshot
                                     continue
@@ -522,12 +520,12 @@ class HedgeBot:
             self.logger.info("✅ Lighter client initialized successfully")
         return self.lighter_client
 
-    def initialize_extended_client(self):
-        """Initialize the Extended client."""
-        if not all([self.extended_vault, self.extended_stark_key_private, self.extended_stark_key_public, self.extended_api_key]):
-            raise ValueError("EXTENDED_VAULT, EXTENDED_STARK_KEY_PRIVATE, EXTENDED_STARK_KEY_PUBLIC, and EXTENDED_API_KEY must be set in environment variables")
+    def initialize_nado_client(self):
+        """Initialize the Nado client."""
+        if not self.nado_private_key:
+            raise ValueError("NADO_PRIVATE_KEY must be set in environment variables")
 
-        # Create config for Extended client
+        # Create config for Nado client
         config_dict = {
             'ticker': self.ticker,
             'contract_id': '',  # Will be set when we get contract info
@@ -536,14 +534,14 @@ class HedgeBot:
             'close_order_side': 'sell'  # Default, will be updated based on strategy
         }
 
-        # Wrap in Config class for Extended client
+        # Wrap in Config class for Nado client
         config = Config(config_dict)
 
-        # Initialize Extended client
-        self.extended_client = ExtendedClient(config)
+        # Initialize Nado client
+        self.nado_client = NadoClient(config)
 
-        self.logger.info("✅ Extended client initialized successfully")
-        return self.extended_client
+        self.logger.info("✅ Nado client initialized successfully")
+        return self.nado_client
 
     def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
@@ -570,195 +568,108 @@ class HedgeBot:
                            price_multiplier,
                            Decimal("1") / (Decimal("10") ** market["supported_price_decimals"])
                            )
-
             raise Exception(f"Ticker {self.ticker} not found")
 
         except Exception as e:
             self.logger.error(f"⚠️ Error getting market config: {e}")
             raise
 
-    async def get_extended_contract_info(self) -> Tuple[str, Decimal]:
-        """Get Extended contract ID and tick size."""
-        if not self.extended_client:
-            raise Exception("Extended client not initialized")
+    async def get_nado_contract_info(self) -> Tuple[str, Decimal]:
+        """Get Nado contract ID and tick size."""
+        if not self.nado_client:
+            raise Exception("Nado client not initialized")
 
-        contract_id, tick_size = await self.extended_client.get_contract_attributes()
+        contract_id, tick_size = await self.nado_client.get_contract_attributes()
 
-        if self.order_quantity < self.extended_client.config.quantity:
+        if self.order_quantity < self.nado_client.config.quantity:
             raise ValueError(
-                f"Order quantity is less than min quantity: {self.order_quantity} < {self.extended_client.config.quantity}")
+                f"Order quantity is less than min quantity: {self.order_quantity} < {self.nado_client.config.quantity}")
 
         return contract_id, tick_size
 
-    async def fetch_extended_bbo_prices(self) -> Tuple[Decimal, Decimal]:
-        """Fetch best bid/ask prices from Extended using websocket data."""
-        # Use WebSocket data if available
-        if self.extended_order_book_ready and self.extended_best_bid and self.extended_best_ask:
-            if self.extended_best_bid > 0 and self.extended_best_ask > 0 and self.extended_best_bid < self.extended_best_ask:
-                return self.extended_best_bid, self.extended_best_ask
+    async def get_nado_position(self) -> Decimal:
+        """Get Nado position."""
+        if not self.nado_client:
+            raise Exception("Nado client not initialized")
 
-        # Fallback to REST API if websocket data is not available
-        self.logger.warning("WebSocket BBO data not available, falling back to REST API")
-        if not self.extended_client:
-            raise Exception("Extended client not initialized")
+        return await self.nado_client.get_account_positions()
 
-        best_bid, best_ask = await self.extended_client.fetch_bbo_prices(self.extended_contract_id)
+    async def fetch_nado_bbo_prices(self) -> Tuple[Decimal, Decimal]:
+        """Fetch best bid/ask prices from Nado using REST API."""
+        if not self.nado_client:
+            raise Exception("Nado client not initialized")
+
+        best_bid, best_ask = await self.nado_client.fetch_bbo_prices(self.nado_client.symbol + '_USDT0')
 
         return best_bid, best_ask
 
     def round_to_tick(self, price: Decimal) -> Decimal:
         """Round price to tick size."""
-        if self.extended_tick_size is None:
+        if self.nado_tick_size is None:
             return price
-        return (price / self.extended_tick_size).quantize(Decimal('1')) * self.extended_tick_size
+        return (price / self.nado_tick_size).quantize(Decimal('1')) * self.nado_tick_size
 
     async def place_bbo_order(self, side: str, quantity: Decimal):
-        # Get best bid/ask prices
-        best_bid, best_ask = await self.fetch_extended_bbo_prices()
-
-        # Place the order using Extended client
-        order_result = await self.extended_client.place_open_order(
-            contract_id=self.extended_contract_id,
+        # Place the order using Nado client
+        order_result = await self.nado_client.place_open_order(
+            contract_id=self.nado_contract_id,
             quantity=quantity,
             direction=side.lower()
         )
 
         if order_result.success:
-            return order_result.order_id, order_result.price
+            return order_result.order_id
         else:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
-    async def place_extended_post_only_order(self, side: str, quantity: Decimal):
-        """Place a post-only order on Extended."""
-        if not self.extended_client:
-            raise Exception("Extended client not initialized")
+    async def place_nado_post_only_order(self, side: str, quantity: Decimal) -> Decimal:
+        """Place a post-only order on Nado."""
+        if not self.nado_client:
+            raise Exception("Nado client not initialized")
 
-        self.extended_order_status = None
-        self.logger.info(f"[OPEN] [Extended] [{side}] Placing Extended POST-ONLY order")
-        order_id, order_price = await self.place_bbo_order(side, quantity)
+        self.nado_order_status = None
+        self.logger.info(f"[Nado] [{side}] Placing Nado POST-ONLY order")
+        order_id = await self.place_bbo_order(side, quantity)
 
         start_time = time.time()
-        last_cancel_time = 0
-        
         while not self.stop_flag:
-            if self.extended_order_status in ['CANCELED', 'CANCELLED']:
-                self.logger.info(f"Order {order_id} was canceled, placing new order")
-                self.extended_order_status = None  # Reset to None to trigger new order
-                order_id, order_price = await self.place_bbo_order(side, quantity)
-                start_time = time.time()
-                last_cancel_time = 0  # Reset cancel timer
-                await asyncio.sleep(0.5)
-            elif self.extended_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
-                await asyncio.sleep(0.5)
-                
-                # Check if we need to cancel and replace the order
-                should_cancel = False
-                if side == 'buy':
-                    if order_price < self.extended_best_bid:
-                        should_cancel = True
-                else:
-                    if order_price > self.extended_best_ask:
-                        should_cancel = True
+            # Poll for order status
+            order_info = await self.nado_client.get_order_info(order_id)
 
-                # Cancel order if it's been too long or price is off
-                current_time = time.time()
-                if current_time - start_time > 10:
-                    if should_cancel and current_time - last_cancel_time > 5:  # Prevent rapid cancellations
-                        try:
-                            self.logger.info(f"Canceling order {order_id} due to timeout/price mismatch")
-                            cancel_result = await self.extended_client.cancel_order(order_id)
-                            self.logger.info(f"cancel_result: {cancel_result}")
-                            if cancel_result.success:
-                                last_cancel_time = current_time
-                                # Don't reset start_time here, let the cancellation trigger new order
-                            else:
-                                self.logger.error(f"❌ Error canceling Extended order: {cancel_result.error_message}")
-                        except Exception as e:
-                            self.logger.error(f"❌ Error canceling Extended order: {e}")
-                    elif not should_cancel:
-                        self.logger.info(f"Waiting for Extended order to be filled (order price is at best bid/ask)")
-            elif self.extended_order_status == 'FILLED':
-                self.logger.info(f"Order {order_id} filled successfully")
-                break
-            else:
-                if self.extended_order_status is not None:
-                    self.logger.error(f"❌ Unknown Extended order status: {self.extended_order_status}")
-                    break
+            status = order_info.status
+            price = order_info.price
+
+            if status in ['FILLED', 'CANCELLED']:
+                self.nado_order_status = status
+                return order_info.filled_size, order_info.price
+            elif time.time() - start_time > self.fill_timeout:
+                best_bid, best_ask = await self.nado_client.fetch_bbo_prices(self.nado_client.symbol + '_USDT0')
+                if side == 'buy':
+                    current_price = best_ask - self.nado_tick_size
+                else:
+                    current_price = best_bid + self.nado_tick_size
+
+                if price != current_price:
+                    self.logger.info(f"[Nado] [{side}] [CANCELING] Price changed, canceling order")
+                    try:
+                        # Cancel the order using Nado client
+                        cancel_result = await self.nado_client.cancel_order(order_id)
+                        if not cancel_result.success:
+                            self.logger.error(f"❌ Error canceling Nado order: {cancel_result.error_message}")
+                            return Decimal(0), Decimal(0)
+                        else:
+                            self.logger.info(f"Failed to cancel Nado order")
+                            return cancel_result.filled_size, cancel_result.price
+                    except Exception as e:
+                        self.logger.error(f"❌ Error canceling Nado order: {e}")
+                        return Decimal(0), Decimal(0)
                 else:
                     await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(0.5)
 
-    def handle_extended_order_book_update(self, message):
-        """Handle Extended order book updates from WebSocket."""
-        try:
-            if isinstance(message, str):
-                message = json.loads(message)
-
-            self.logger.debug(f"Received Extended order book message: {message}")
-
-            # Check if this is an order book update message
-            if message.get("type") in ["SNAPSHOT", "DELTA"]:
-                data = message.get("data", {})
-
-                if data:
-                    # Handle SNAPSHOT - replace entire order book
-                    if message.get("type") == "SNAPSHOT":
-                        self.extended_order_book['bids'].clear()
-                        self.extended_order_book['asks'].clear()
-
-                    # Update bids - Extended format is [{"p": "price", "q": "size"}, ...]
-                    bids = data.get('b', [])
-                    for bid in bids:
-                        if isinstance(bid, dict):
-                            price = Decimal(bid.get('p', '0'))
-                            size = Decimal(bid.get('q', '0'))
-                        else:
-                            # Fallback for array format [price, size]
-                            price = Decimal(bid[0])
-                            size = Decimal(bid[1])
-                        
-                        if size > 0:
-                            self.extended_order_book['bids'][price] = size
-                        else:
-                            # Remove zero size orders
-                            self.extended_order_book['bids'].pop(price, None)
-
-                    # Update asks - Extended format is [{"p": "price", "q": "size"}, ...]
-                    asks = data.get('a', [])
-                    for ask in asks:
-                        if isinstance(ask, dict):
-                            price = Decimal(ask.get('p', '0'))
-                            size = Decimal(ask.get('q', '0'))
-                        else:
-                            # Fallback for array format [price, size]
-                            price = Decimal(ask[0])
-                            size = Decimal(ask[1])
-                        
-                        if size > 0:
-                            self.extended_order_book['asks'][price] = size
-                        else:
-                            # Remove zero size orders
-                            self.extended_order_book['asks'].pop(price, None)
-
-                    # Update best bid and ask
-                    if self.extended_order_book['bids']:
-                        self.extended_best_bid = max(self.extended_order_book['bids'].keys())
-                    if self.extended_order_book['asks']:
-                        self.extended_best_ask = min(self.extended_order_book['asks'].keys())
-
-                    if not self.extended_order_book_ready:
-                        self.extended_order_book_ready = True
-                        self.logger.info(f"📊 Extended order book ready - Best bid: {self.extended_best_bid}, "
-                                         f"Best ask: {self.extended_best_ask}")
-                    else:
-                        self.logger.debug(f"📊 Order book updated - Best bid: {self.extended_best_bid}, "
-                                          f"Best ask: {self.extended_best_ask}")
-
-        except Exception as e:
-            self.logger.error(f"Error handling Extended order book update: {e}")
-            self.logger.error(f"Message content: {message}")
-
-    def handle_extended_order_update(self, order_data):
-        """Handle Extended order updates from WebSocket."""
+    def handle_nado_order_update(self, order_data):
+        """Handle Nado order updates."""
         side = order_data.get('side', '').lower()
         filled_size = Decimal(order_data.get('filled_size', '0'))
         price = Decimal(order_data.get('price', '0'))
@@ -781,9 +692,7 @@ class HedgeBot:
 
         self.waiting_for_lighter_fill = True
 
-        self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price}")
-
-    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
+    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal):
         if not self.lighter_client:
             await self.initialize_lighter_client()
 
@@ -791,13 +700,14 @@ class HedgeBot:
 
         # Determine order parameters
         if lighter_side.lower() == 'buy':
+            order_type = "CLOSE"
             is_ask = False
             price = best_ask[0] * Decimal('1.002')
         else:
+            order_type = "OPEN"
             is_ask = True
             price = best_bid[0] * Decimal('0.998')
 
-        self.logger.info(f"Placing Lighter market order: {lighter_side} {quantity} | is_ask: {is_ask}")
 
         # Reset order state
         self.lighter_order_filled = False
@@ -827,7 +737,9 @@ class HedgeBot:
                 tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
                 tx_info=tx_info
             )
-            self.logger.info(f"🚀 Lighter limit order sent: {lighter_side} {quantity}")
+
+            self.logger.info(f"[Lighter] [OPEN]: {quantity}")
+
             await self.monitor_lighter_order(client_order_index)
 
             return tx_hash
@@ -837,7 +749,6 @@ class HedgeBot:
 
     async def monitor_lighter_order(self, client_order_index: int):
         """Monitor Lighter order and adjust price if needed."""
-        self.logger.info(f"🔍 Starting to monitor Lighter order - Order ID: {client_order_index}")
 
         start_time = time.time()
         while not self.lighter_order_filled and not self.stop_flag:
@@ -890,144 +801,44 @@ class HedgeBot:
             import traceback
             self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
 
-    async def setup_extended_websocket(self):
-        """Setup Extended websocket for order updates and order book data."""
-        if not self.extended_client:
-            raise Exception("Extended client not initialized")
+    def get_lighter_position(self):
+        url = "https://mainnet.zklighter.elliot.ai/api/v1/account"
+        headers = {"accept": "application/json"}
 
-        def order_update_handler(order_data):
-            """Handle order updates from Extended WebSocket."""
-            if order_data.get('contract_id') != self.extended_contract_id:
-                self.logger.info(f"Ignoring order update from {order_data.get('contract_id')}")
-                return
-
-            try:
-                order_id = order_data.get('order_id')
-                status = order_data.get('status')
-                side = order_data.get('side', '').lower()
-                filled_size = Decimal(order_data.get('filled_size', '0'))
-                size = Decimal(order_data.get('size', '0'))
-                price = order_data.get('price', '0')
-
-                if side == 'buy':
-                    order_type = "OPEN"
-                else:
-                    order_type = "CLOSE"
-
-                # Handle the order update
-                if status == 'FILLED':
-                    if side == 'buy':
-                        self.extended_position += filled_size
-                    else:
-                        self.extended_position -= filled_size
-                    self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: {filled_size} @ {price}")
-                    self.extended_order_status = status
-
-                    # Log Extended trade to CSV
-                    self.log_trade_to_csv(
-                        exchange='Extended',
-                        side=side,
-                        price=str(price),
-                        quantity=str(filled_size)
-                    )
-
-                    self.handle_extended_order_update({
-                        'order_id': order_id,
-                        'side': side,
-                        'status': status,
-                        'size': size,
-                        'price': price,
-                        'contract_id': self.extended_contract_id,
-                        'filled_size': filled_size
-                    })
-                else:
-                    if status == 'OPEN':
-                        self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: {size} @ {price}")
-                    else:
-                        self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: {filled_size} @ {price}")
-                    # Update order status for all non-filled statuses
-                    if status == 'PARTIALLY_FILLED':
-                        self.extended_order_status = "OPEN"
-                    elif status in ['CANCELED', 'CANCELLED']:
-                        self.extended_order_status = status
-                    elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
-                        self.extended_order_status = status
-                    else:
-                        self.logger.warning(f"Unknown order status: {status}")
-                        self.extended_order_status = status
-
-            except Exception as e:
-                self.logger.error(f"Error handling Extended order update: {e}")
-
+        current_position = None
+        parameters = {"by": "index", "value": self.account_index}
         try:
-            # Setup order update handler
-            self.extended_client.setup_order_update_handler(order_update_handler)
-            self.logger.info("✅ Extended WebSocket order update handler set up")
+            response = requests.get(url, headers=headers, params=parameters, timeout=10)
+            response.raise_for_status()  # Raise an exception for bad status codes
 
-            # Connect to Extended WebSocket
-            await self.extended_client.connect()
-            self.logger.info("✅ Extended WebSocket connection established")
+            # Check if response has content
+            if not response.text.strip():
+                print("⚠️ Empty response from Lighter API for position check")
+                return self.lighter_position
 
-            # Setup separate WebSocket connection for depth updates
-            await self.setup_extended_depth_websocket()
+            data = response.json()
 
+            if 'accounts' not in data or not data['accounts']:
+                print(f"⚠️ Unexpected response format from Lighter API: {data}")
+                return self.lighter_position
+
+            positions = data['accounts'][0].get('positions', [])
+            for position in positions:
+                if position.get('symbol') == self.ticker:
+                    current_position = Decimal(position['position']) * position['sign']
+                    break
+            if current_position is None:
+                current_position = 0
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Network error getting position: {e}")
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON parsing error in position response: {e}")
+            print(f"Response text: {response.text[:200]}...")  # Show first 200 chars
         except Exception as e:
-            self.logger.error(f"Could not setup Extended WebSocket handlers: {e}")
+            print(f"⚠️ Unexpected error getting position: {e}")
 
-    async def setup_extended_depth_websocket(self):
-        """Setup separate WebSocket connection for Extended depth updates."""
-        try:
-            import websockets
-
-            async def handle_depth_websocket():
-                """Handle depth WebSocket connection."""
-                # Use the correct Extended WebSocket URL for order book stream
-                market_name = f"{self.ticker}-USD"  # Extended uses format like BTC-USD
-                url = f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{market_name}?depth=1"
-
-                while not self.stop_flag:
-                    try:
-                        async with websockets.connect(url) as ws:
-                            self.logger.info(f"✅ Connected to Extended order book stream for {market_name}")
-
-                            # Listen for messages
-                            async for message in ws:
-                                if self.stop_flag:
-                                    break
-
-                                try:
-                                    # Handle ping frames
-                                    if isinstance(message, bytes) and message == b'\x09':
-                                        await ws.pong()
-                                        continue
-
-                                    data = json.loads(message)
-                                    self.logger.debug(f"Received Extended order book message: {data}")
-
-                                    # Handle order book updates
-                                    if data.get("type") in ["SNAPSHOT", "DELTA"]:
-                                        self.handle_extended_order_book_update(data)
-
-                                except json.JSONDecodeError as e:
-                                    self.logger.warning(f"Failed to parse Extended order book message: {e}")
-                                except Exception as e:
-                                    self.logger.error(f"Error handling Extended order book message: {e}")
-
-                    except websockets.exceptions.ConnectionClosed:
-                        self.logger.warning("Extended order book WebSocket connection closed, reconnecting...")
-                    except Exception as e:
-                        self.logger.error(f"Extended order book WebSocket error: {e}")
-
-                    # Wait before reconnecting
-                    if not self.stop_flag:
-                        await asyncio.sleep(2)
-
-            # Start depth WebSocket in background
-            asyncio.create_task(handle_depth_websocket())
-            self.logger.info("✅ Extended order book WebSocket task started")
-
-        except Exception as e:
-            self.logger.error(f"Could not setup Extended order book WebSocket: {e}")
+        return current_position
 
     async def trading_loop(self):
         """Main trading loop implementing the new strategy."""
@@ -1036,41 +847,36 @@ class HedgeBot:
         # Initialize clients
         try:
             self.initialize_lighter_client()
-            self.initialize_extended_client()
+            self.initialize_nado_client()
 
             # Get contract info
-            self.extended_contract_id, self.extended_tick_size = await self.get_extended_contract_info()
+            self.nado_contract_id, self.nado_tick_size = await self.get_nado_contract_info()
             self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier, self.tick_size = self.get_lighter_market_config()
 
-            self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, "
+            self.logger.info(f"Contract info loaded - Nado: {self.nado_contract_id}, "
                              f"Lighter: {self.lighter_market_index}")
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
             return
 
-        # Setup Extended websocket
+        # Connect to Nado
         try:
-            await self.setup_extended_websocket()
-            self.logger.info("✅ Extended WebSocket connection established")
+            await self.nado_client.connect()
+            self.logger.info("✅ Nado client connected")
 
-            # Wait for initial order book data with timeout
-            self.logger.info("⏳ Waiting for initial order book data...")
-            timeout = 10  # seconds
-            start_time = time.time()
-            while not self.extended_order_book_ready and not self.stop_flag:
-                if time.time() - start_time > timeout:
-                    self.logger.warning(f"⚠️ Timeout waiting for WebSocket order book data after {timeout}s")
-                    break
-                await asyncio.sleep(0.5)
-
-            if self.extended_order_book_ready:
-                self.logger.info("✅ WebSocket order book data received")
+            # Fetch initial BBO prices
+            best_bid, best_ask = await self.fetch_nado_bbo_prices()
+            if best_bid > 0 and best_ask > 0:
+                self.nado_best_bid = best_bid
+                self.nado_best_ask = best_ask
+                self.nado_order_book_ready = True
+                self.logger.info(f"✅ Nado order book ready - Best bid: {best_bid}, Best ask: {best_ask}")
             else:
-                self.logger.warning("⚠️ WebSocket order book not ready, will use REST API fallback")
+                self.logger.warning("⚠️ Failed to get initial Nado order book data")
 
         except Exception as e:
-            self.logger.error(f"❌ Failed to setup Extended websocket: {e}")
+            self.logger.error(f"❌ Failed to connect to Nado: {e}")
             return
 
         # Setup Lighter websocket
@@ -1100,114 +906,102 @@ class HedgeBot:
         await asyncio.sleep(5)
 
         iterations = 0
+        self.lighter_position = self.get_lighter_position()
+        self.nado_position = await self.get_nado_position()
         while iterations < self.iterations and not self.stop_flag:
             iterations += 1
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
             self.logger.info("-----------------------------------------------")
 
-            self.logger.info(f"[STEP 1] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            while self.nado_position < self.max_position and not self.stop_flag:
+                self.lighter_position = self.get_lighter_position()
+                self.nado_position = await self.get_nado_position()
+                self.logger.info(f"Buying up to {self.max_position} | Nado position: {self.nado_position} | Lighter position: {self.lighter_position}")
+                if abs(self.nado_position + self.lighter_position) > self.order_quantity*2:
+                    self.logger.error(f"❌ Position diff is too large: {self.nado_position + self.lighter_position}")
+                    sys.exit(1)
 
-            if abs(self.extended_position + self.lighter_position) > self.order_quantity*2:
-                self.logger.error(f"❌ Position diff is too large: {self.extended_position + self.lighter_position}")
-                break
+                self.order_execution_complete = False
+                self.waiting_for_lighter_fill = False
+                try:
+                    # Determine side based on some logic (for now, alternate)
+                    side = 'buy'
+                    filled_size, filled_price = await self.place_nado_post_only_order(side, self.order_quantity)
+                    if filled_size == 0:
+                        self.logger.info(f"[Nado] [{side}] [CANCELLED]")
+                        continue
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error placing nado post only order: {e}")
+                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                    continue
 
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'buy'
-                await self.place_extended_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+                self.logger.info(f"[Nado] [{side}] [FILLED]: {filled_size} @ {filled_price}")
+                # Log Nado trade to CSV
+                self.log_trade_to_csv(
+                    exchange='Nado',
+                    side='buy',
+                    price=str(filled_price),
+                    quantity=str(filled_size)
+                )
 
-            start_time = time.time()
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
+                self.nado_position += filled_size
 
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
+                await self.place_lighter_market_order(
+                    'sell',
+                    abs(filled_size)
+                )
 
-            if self.stop_flag:
-                break
-
-            # Sleep after step 1
             if self.sleep_time > 0:
-                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
+                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds ...")
                 await asyncio.sleep(self.sleep_time)
 
-            # Close position
-            self.logger.info(f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'sell'
-                await self.place_extended_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+            exit_after_next_trade = False
+            while self.nado_position > -1 * self.max_position and not self.stop_flag:
+                self.lighter_position = self.get_lighter_position()
+                self.nado_position = await self.get_nado_position()
+                self.logger.info(f"Selling up to -{self.max_position} | Nado position: {self.nado_position} | Lighter position: {self.lighter_position}")
+                if abs(self.nado_position + self.lighter_position) > self.order_quantity*2:
+                    self.logger.error(f"❌ Position diff is too large: {self.nado_position + self.lighter_position}")
+                    sys.exit(1)
 
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
+                if iterations == self.iterations:
+                    if self.nado_position>0 and self.nado_position <= self.order_quantity:
+                        exit_after_next_trade = True
 
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
+                try:
+                    # Determine side based on some logic (for now, alternate)
+                    side = 'sell'
+                    if exit_after_next_trade:
+                        filled_size, filled_price = await self.place_nado_post_only_order(side, abs(self.nado_position))
+                    else:
+                        filled_size, filled_price = await self.place_nado_post_only_order(side, self.order_quantity)
+                    if filled_size == 0:
+                        self.logger.info(f"[Nado] [{side}] [CANCELLED]")
+                        continue
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error placing nado post only order: {e}")
+                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                    continue
 
-            # Close remaining position
-            self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            if self.extended_position == 0:
-                continue
-            elif self.extended_position > 0:
-                side = 'sell'
-            else:
-                side = 'buy'
+                self.logger.info(f"[Nado] [{side}] [FILLED]: {filled_size} @ {filled_price}")
+                # Log Nado trade to CSV
+                self.log_trade_to_csv(
+                    exchange='Nado',
+                    side='sell',
+                    price=str(filled_price),
+                    quantity=str(filled_size)
+                )
 
-            try:
-                # Determine side based on some logic (for now, alternate)
-                await self.place_extended_post_only_order(side, abs(self.extended_position))
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+                self.nado_position -= abs(filled_size)
 
-            # Wait for order to be filled via WebSocket
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
+                await self.place_lighter_market_order(
+                    'buy',
+                    abs(filled_size)
+                )
 
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
+                if exit_after_next_trade:
+                    self.logger.info("Position back to zero. Done! Exiting...")
                     break
 
     async def run(self):
@@ -1221,22 +1015,3 @@ class HedgeBot:
         finally:
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()
-
-
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Trading bot for Extended and Lighter')
-    parser.add_argument('--exchange', type=str,
-                        help='Exchange')
-    parser.add_argument('--ticker', type=str, default='BTC',
-                        help='Ticker symbol (default: BTC)')
-    parser.add_argument('--size', type=str,
-                        help='Number of tokens to buy/sell per order')
-    parser.add_argument('--iter', type=int,
-                        help='Number of iterations to run')
-    parser.add_argument('--fill-timeout', type=int, default=5,
-                        help='Timeout in seconds for maker order fills (default: 5)')
-    parser.add_argument('--sleep', type=int, default=0,
-                        help='Sleep time in seconds after each step (default: 0)')
-
-    return parser.parse_args()
