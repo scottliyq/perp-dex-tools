@@ -8,6 +8,7 @@ import json
 import time
 from typing import Dict, Any, List, Optional, Tuple, Callable
 import websockets
+import os
 
 
 class LighterCustomWebSocketManager:
@@ -19,7 +20,7 @@ class LighterCustomWebSocketManager:
         self.logger = None
         self.running = False
         self.ws = None
-
+        self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX', '0'))
         # Order book state
         self.order_book = {"bids": {}, "asks": {}}
         self.best_bid = None
@@ -95,20 +96,16 @@ class LighterCustomWebSocketManager:
 
         # Check if the new offset is sequential (should be +1)
         expected_offset = self.order_book_offset + 1
-        if new_offset == expected_offset:
+        if new_offset >= expected_offset:
             # Sequential update, update our offset
             self.order_book_offset = new_offset
             self.order_book_sequence_gap = False
             return True
-        elif new_offset > expected_offset:
+        elif new_offset < expected_offset:
             # Gap detected - we missed some updates
             self._log(f"Order book sequence gap detected! Expected offset {expected_offset}, got {new_offset}", "WARNING")
             self.order_book_sequence_gap = True
             return False
-        else:
-            # Out of order or duplicate update
-            self._log(f"Out of order update received! Expected offset {expected_offset}, got {new_offset}", "WARNING")
-            return True  # Don't reconnect for out-of-order updates, just ignore them
 
     def handle_order_book_cutoff(self, data: Dict[str, Any]) -> bool:
         """Handle cases where order book updates might be cutoff or incomplete."""
@@ -263,9 +260,7 @@ class LighterCustomWebSocketManager:
                     # Get auth token for the subscription
                     try:
                         if self.lighter_client:
-                            # Set auth token to expire in 10 minutes
-                            ten_minutes_deadline = int(time.time() + 10 * 60)
-                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(api_key_index=self.api_key_index)
                             if err is not None:
                                 self._log(f"Failed to create auth token for account orders subscription: {err}", "WARNING")
                             else:
