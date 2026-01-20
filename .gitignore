@@ -200,3 +200,4 @@ cython_debug/
 uv.lock
 .grvt_aster_env
 nohup.out
+.grvt_paradex_env

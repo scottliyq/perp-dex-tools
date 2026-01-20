@@ -3,6 +3,7 @@
 ---
 
 **更新日志**：
+- **2025-12-23**: 新增 `hedge_mode_grvt_paradex.py` 实现 GRVT 与 Paradex 对冲功能。当 GRVT 主账户订单成功后，在 Paradex 账户下市价对冲单。
 - **2025-12-07**: 新增 `hedge_mode_grvt_grvt.py` 实现 GRVT 账户间对冲功能。当主账户（GRVT1）订单成功后，在另一个 GRVT 账户（GRVT2）下市价对冲单。
 
 ---
